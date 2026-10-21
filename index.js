@@ -20939,12 +20939,20 @@ async function onPromptReady(eventData) {
             const lastMsg = chat[chat.length - 1];
             if (lastMsg && !lastMsg.is_user && lastMsg.horae_meta && (
                 lastMsg.horae_meta.timestamp?.story_date ||
+                lastMsg.horae_meta.timestamp?.story_time ||
                 lastMsg.horae_meta.scene?.location ||
+                lastMsg.horae_meta.scene?.atmosphere ||
+                (lastMsg.horae_meta.scene?.characters_present || []).length > 0 ||
                 Object.keys(lastMsg.horae_meta.items || {}).length > 0 ||
+                (lastMsg.horae_meta.deletedItems || []).length > 0 ||
                 Object.keys(lastMsg.horae_meta.costumes || {}).length > 0 ||
                 Object.keys(lastMsg.horae_meta.affection || {}).length > 0 ||
                 Object.keys(lastMsg.horae_meta.npcs || {}).length > 0 ||
                 (lastMsg.horae_meta.events || []).length > 0 ||
+                (lastMsg.horae_meta.agenda || []).length > 0 ||
+                (lastMsg.horae_meta.deletedAgenda || []).length > 0 ||
+                Object.keys(lastMsg.horae_meta.mood || {}).length > 0 ||
+                (lastMsg.horae_meta.relationships || []).length > 0 ||
                 (lastMsg.horae_meta._rpgChanges && Object.keys(lastMsg.horae_meta._rpgChanges).length > 0)
             )) {
                 skipLast = 1;
@@ -21288,17 +21296,33 @@ function _sanitizeLeakedHoraeTags(messageEl) {
 function onSwipePanel(messageId) {
     if (!settings.enabled) return;
 
+    // 立即清空元数据，防止旧状态被带入下一次生成
+    try {
+        const msg = horaeManager.getChat()[messageId];
+        if (!msg || msg.is_user) return;
+
+        const savedFlags = _saveCompressedFlags(msg.horae_meta);
+        const savedGlobal = messageId === 0 ? _saveGlobalMeta(msg.horae_meta) : null;
+
+        // 立即清空，不等待 setTimeout
+        msg.horae_meta = createEmptyMeta();
+        _restoreCompressedFlags(msg.horae_meta, savedFlags);
+        if (savedGlobal) _restoreGlobalMeta(msg.horae_meta, savedGlobal);
+    } catch (err) {
+        console.error(`[Horae] onSwipePanel #${messageId} 立即清空失败:`, err);
+    }
+
+    // 延迟执行重新解析和重建，避免阻塞酒馆的 swipe 流程
     setTimeout(() => {
         try {
             const msg = horaeManager.getChat()[messageId];
             if (!msg || msg.is_user) return;
 
-            const savedFlags = _saveCompressedFlags(msg.horae_meta);
-            const savedGlobal = messageId === 0 ? _saveGlobalMeta(msg.horae_meta) : null;
-            msg.horae_meta = createEmptyMeta();
-            horaeManager.processAIResponse(messageId, msg.mes);
-            _restoreCompressedFlags(msg.horae_meta, savedFlags);
-            if (savedGlobal) _restoreGlobalMeta(msg.horae_meta, savedGlobal);
+            // 只在消息内容不是 "..." 时才重新解析
+            // "..." 表示正在生成新回复，此时不应该解析旧内容
+            if (msg.mes && msg.mes.trim() !== '...' && msg.mes.trim() !== '…') {
+                horaeManager.processAIResponse(messageId, msg.mes);
+            }
 
             horaeManager.rebuildTableData();
             horaeManager.rebuildRelationships();
@@ -21310,7 +21334,7 @@ function onSwipePanel(messageId) {
             renderCustomTablesList();
             _snapshotCurrentChatMessageRefs();
         } catch (err) {
-            console.error(`[Horae] onSwipePanel #${messageId} 失败:`, err);
+            console.error(`[Horae] onSwipePanel #${messageId} 延迟处理失败:`, err);
         }
 
         if (settings.showMessagePanel) {
