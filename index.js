@@ -21308,11 +21308,18 @@ function onSwipePanel(messageId) {
         msg.horae_meta = createEmptyMeta();
         _restoreCompressedFlags(msg.horae_meta, savedFlags);
         if (savedGlobal) _restoreGlobalMeta(msg.horae_meta, savedGlobal);
+
+        // 立即重建关系网络、场景记忆等派生数据
+        // 确保 chat[0] 不再包含当前消息的旧关系/场景等数据
+        horaeManager.rebuildTableData();
+        horaeManager.rebuildRelationships();
+        horaeManager.rebuildLocationMemory();
+        horaeManager.rebuildRpgData();
     } catch (err) {
         console.error(`[Horae] onSwipePanel #${messageId} 立即清空失败:`, err);
     }
 
-    // 延迟执行重新解析和重建，避免阻塞酒馆的 swipe 流程
+    // 延迟执行重新解析，避免阻塞酒馆的 swipe 流程
     setTimeout(() => {
         try {
             const msg = horaeManager.getChat()[messageId];
@@ -21322,14 +21329,14 @@ function onSwipePanel(messageId) {
             // "..." 表示正在生成新回复，此时不应该解析旧内容
             if (msg.mes && msg.mes.trim() !== '...' && msg.mes.trim() !== '…') {
                 horaeManager.processAIResponse(messageId, msg.mes);
+                // 重新解析后，再次重建派生数据
+                horaeManager.rebuildTableData();
+                horaeManager.rebuildRelationships();
+                horaeManager.rebuildLocationMemory();
+                horaeManager.rebuildRpgData();
             }
 
-            horaeManager.rebuildTableData();
-            horaeManager.rebuildRelationships();
-            horaeManager.rebuildLocationMemory();
-            horaeManager.rebuildRpgData();
             getContext().saveChat();
-
             refreshAllDisplays();
             renderCustomTablesList();
             _snapshotCurrentChatMessageRefs();
