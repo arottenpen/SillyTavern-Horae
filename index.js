@@ -2564,7 +2564,12 @@ async function setMessagesHidden(chat, indices, hidden) {
                 _hideUnhideDebugStats[action]++;
                 _hideUnhideDebugStats[msgCounterKey] += covered;
                 console.log(`[Horae][Debug] /${action} call#${_hideUnhideDebugStats[action]} (batch#${batchId} ${i + 1}/${ranges.length}) range=${rangeArg} covers=${covered}`);
-                await exec(`${cmd} ${rangeArg}`);
+                // 解析失败时该函数不抛异常，只返回一个没有 isError 的空结果；
+                // 范围越界时 /hide 回调也只 console.warn 后返回空串。两种情况都要靠下面的核验兜住。
+                const result = await exec(`${cmd} ${rangeArg}`);
+                if (result?.isError) {
+                    console.warn(`[Horae] ${cmd} ${rangeArg} 执行报错: ${result.errorMessage || '未知错误'}`);
+                }
             } catch (cmdErr) {
                 console.warn(`[Horae] ${cmd} ${rangeArg} 失败:`, cmdErr);
             }
@@ -2574,15 +2579,33 @@ async function setMessagesHidden(chat, indices, hidden) {
         console.warn('[Horae] 无法加载酒馆命令模块，回退到手动设置:', e);
     }
 
-    // 后验证 + DOM 同步 + 强制 save（不依赖 /hide 是否成功）
+    // 核验原生命令是否真的生效。ST 1.19 只认 is_system 决定楼层进不进提示词，
+    // is_hidden 只是 Horae 自己的记账，命令失败时不能把它当成隐藏成功。
+    const missed = [];
     for (const idx of indices) {
         if (!chat[idx]) continue;
         chat[idx].is_hidden = hidden;
-        const $el = $(`.mes[mesid="${idx}"]`);
-        if (hidden) $el.attr('is_hidden', 'true');
-        else $el.removeAttr('is_hidden');
+        if (!!chat[idx].is_system === hidden) continue;
+        missed.push(idx);
+        _applyNativeHiddenState(chat, idx, hidden);
+    }
+    if (missed.length > 0) {
+        console.warn(`[Horae] ${hidden ? '/hide' : '/unhide'} 未生效，已按 ST 原生语义回退 ${missed.length} 层: ${missed.join(',')}`);
     }
     await getContext().saveChat();
+}
+
+/**
+ * 按 ST 1.19 hideChatMessageRange 的隐藏语义直接写一条消息：
+ * message.is_system 决定是否进入提示词，DOM 的 is_system 属性决定界面是否折叠。
+ * 不调用 refreshSwipeButtons()，swipe 相关逻辑不在本次修复范围内。
+ */
+function _applyNativeHiddenState(chat, idx, hidden) {
+    const message = chat?.[idx];
+    if (!message) return;
+    message.is_system = hidden;
+    const $el = $(`.mes[mesid="${idx}"]`);
+    if ($el.length) $el.attr('is_system', String(hidden));
 }
 
 /** 归一化摘要层级：缺失/非法一律回落到 1 */
@@ -2825,8 +2848,13 @@ async function toggleSummaryActive(summaryId) {
     entry.active = !entry.active;
     // 同步消息可见性：active=摘要模式→隐藏原消息，inactive=原始模式→显示原消息
     const indices = getSummaryMsgIndices(entry);
-    await setMessagesHidden(chat, indices, entry.active);
-    await getContext().saveChat();
+    if (indices.length) {
+        // setMessagesHidden 内部已经 saveChat，这里不再重复存
+        await setMessagesHidden(chat, indices, entry.active);
+    } else {
+        // 空范围时 setMessagesHidden 会直接 return 而不存盘，entry.active 需要自己落盘
+        await getContext().saveChat();
+    }
     updateTimelineDisplay();
 }
 
@@ -3819,7 +3847,6 @@ async function compressSelectedTimelineEvents() {
         for (let i = rangeMin; i <= rangeMax; i++) hideIndices.push(i);
         await setMessagesHidden(chat, hideIndices, true);
 
-        await context.saveChat();
         overlay.remove();
         exitTimelineMultiSelect();
         updateTimelineDisplay();
@@ -10055,11 +10082,11 @@ async function enforceHiddenState() {
         const summaryId = s.id;
         for (const i of getSummaryMsgIndices(s)) {
             if (i === 0 || !chat[i]) continue;
-            if (!chat[i].is_hidden) {
+            if (!chat[i].is_hidden || !chat[i].is_system) {
                 chat[i].is_hidden = true;
+                // 提示词过滤只认 is_system，只补 is_hidden 修不回已经漂移的楼层
+                _applyNativeHiddenState(chat, i, true);
                 fixed++;
-                const $el = $(`.mes[mesid="${i}"]`);
-                if ($el.length) $el.attr('is_hidden', 'true');
             }
             const events = chat[i].horae_meta?.events;
             if (events) {
@@ -10096,12 +10123,12 @@ function repairAllSummaryStates() {
         const summaryId = s.id;
         for (const i of getSummaryMsgIndices(s)) {
             if (i === 0 || !chat[i]) continue;
-            if (!chat[i].is_hidden) {
+            if (!chat[i].is_hidden || !chat[i].is_system) {
                 chat[i].is_hidden = true;
+                // 提示词过滤只认 is_system，只补 is_hidden 修不回已经漂移的楼层
+                _applyNativeHiddenState(chat, i, true);
                 fixed++;
             }
-            const $el = $(`.mes[mesid="${i}"]`);
-            if ($el.length) $el.attr('is_hidden', 'true');
             const events = chat[i].horae_meta?.events;
             if (events) {
                 for (const evt of events) {
@@ -17847,7 +17874,9 @@ async function _syncAutoSummaryBufferHidden(chat, targetHideIndices, activeSumma
     for (const idx of targetSet) {
         if (!chat[idx].horae_meta) chat[idx].horae_meta = createEmptyMeta();
         chat[idx].horae_meta._autoBufferHidden = true;
-        if (!chat[idx].is_hidden && !activeSummaryCoveredIndices?.has(idx)) {
+        // 以 ST 真正认的 is_system 为准，而不是 Horae 自己的 is_hidden。
+        // 否则一次 /hide 失败后 is_hidden 已被写上，这里永远不会再重试，楼层就一直留在提示词里。
+        if (!chat[idx].is_system && !activeSummaryCoveredIndices?.has(idx)) {
             toHide.push(idx);
         }
     }
@@ -18169,10 +18198,10 @@ async function checkAutoSummary() {
             }
         }
 
-        // 只 hide 实际进入 batch 的消息，避免误盖到其它 entry 范围内的消息
+        // 只 hide 实际进入 batch 的消息，避免误盖到其它 entry 范围内的消息。
+        // setMessagesHidden 内部已经 saveChat；finally 里还有一次权威存盘，这里不再重复。
         await setMessagesHidden(chat, [...msgIndices], true);
 
-        await context.saveChat();
         updateTimelineDisplay();
         showToast(t('toast.autoSummaryDone', { from: msgIndices[0], to: msgIndices[msgIndices.length - 1] }), 'success');
     } catch (err) {
