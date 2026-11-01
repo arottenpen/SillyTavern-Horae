@@ -336,6 +336,8 @@ let _summaryInProgress = false;
 let _panelAiAnalyzeInProgress = false;
 let _chatFullyLoaded = false;
 let _portsReady = false;
+// Token 计数器在抽屉不可见时跳过重算，置脏标记，等抽屉打开再补一次
+let _tokenCounterDirty = false;
 let _autoSummaryRanThisTurn = false;
 let _vectorEnsureIndexPromise = null;
 let _vectorEnsureIndexChatId = null;
@@ -9877,14 +9879,22 @@ function _renderRpgHudFromSnapshot(messageEl, messageIndex, rpg) {
 function refreshAllDisplays() {
     buildPanelContent._affCache = null;
     enforceHiddenState();
-    updateStatusDisplay();
-    updateAgendaDisplay();
-    updateTimelineDisplay();
-    updateCharactersDisplay();
-    updateItemsDisplay();
-    updateLocationMemoryDisplay();
-    updateRpgDisplay();
-    updateTokenCounter();
+    // 下面这组显示函数各自独立调用 getLatestState()（共 8 次，updateRpgDisplay 占 2 次），
+    // 而它是从 0 号楼层全量重放。用一次作用域把这些重放合并成一次；
+    // 离开作用域立即丢弃缓存，不跨回合保留。
+    horaeManager.beginStateScope();
+    try {
+        updateStatusDisplay();
+        updateAgendaDisplay();
+        updateTimelineDisplay();
+        updateCharactersDisplay();
+        updateItemsDisplay();
+        updateLocationMemoryDisplay();
+        updateRpgDisplay();
+        updateTokenCounter();
+    } finally {
+        horaeManager.endStateScope();
+    }
     refreshHoraePorts();
 }
 
@@ -10502,6 +10512,13 @@ function openLocationMergeModal() {
 function updateTokenCounter() {
     const el = document.getElementById('horae-token-value');
     if (!el) return;
+    // 这个数字只在抽屉里，抽屉收起时 offsetParent 为 null。
+    // 重算要整段生成注入提示词再数 token，不可见时直接跳过，打开抽屉时再补算。
+    if (!el.offsetParent) {
+        _tokenCounterDirty = true;
+        return;
+    }
+    _tokenCounterDirty = false;
     try {
         const dataPrompt = horaeManager.generateCompactPrompt();
         const rulesPrompt = horaeManager.generateSystemPromptAddition();
@@ -12951,6 +12968,28 @@ async function initDrawer() {
         toggle.on('click', openDrawerLegacy);
         console.log(`[Horae] 使用旧版抽屉模式`);
     }
+
+    // 抽屉收起时 updateTokenCounter 跳过重算并置脏，展开后补一次
+    toggle.on('click', () => _flushTokenCounterWhenVisible());
+}
+
+/**
+ * 抽屉/标签页/折叠段的显示切换都带动画，点击瞬间 offsetParent 还是 null。
+ * 分几次轮询补算，命中即停；全程只在置脏时才做事。
+ */
+function _flushTokenCounterWhenVisible() {
+    if (!_tokenCounterDirty) return;
+    let tries = 0;
+    const tick = () => {
+        if (!_tokenCounterDirty) return;
+        const el = document.getElementById('horae-token-value');
+        if (el?.offsetParent) {
+            updateTokenCounter();
+            return;
+        }
+        if (++tries < 4) setTimeout(tick, 120);
+    };
+    setTimeout(tick, 120);
 }
 
 /**
@@ -12980,6 +13019,10 @@ function initTabs() {
                 break;
             case 'items':
                 updateItemsDisplay();
+                break;
+            case 'settings':
+                // Token 计数器在本页，切过来时补算被跳过的那次
+                _flushTokenCounterWhenVisible();
                 break;
             default: {
                 if ($tab.hasClass('horae-port-tab')) {
@@ -14629,7 +14672,8 @@ function initSettingsEvents() {
     $('#horae-send-to-ai-collapse-toggle').on('click', function () {
         const body = $('#horae-send-to-ai-collapse-body');
         const icon = $(this).find('.horae-collapse-icon');
-        body.slideToggle(200);
+        // Token 计数器在这一段里，展开后补算被跳过的那次
+        body.slideToggle(200, () => _flushTokenCounterWhenVisible());
         icon.toggleClass('collapsed');
     });
 
@@ -16085,8 +16129,30 @@ function _updateVectorStatus() {
     }
 }
 
+/**
+ * 每次召回前 prune 和 gap 两趟扫描会对同一批楼层重复 buildVectorDocument，
+ * 这里按楼层号缓存一次构建结果，两趟共用。只缓存「原始构建值」——
+ * 两趟的排除条件不同（prune 另外排除 _carryoverSeed），排除判断仍各自做。
+ */
+function _makeVectorDocCache() {
+    const docs = new Map();
+    return {
+        doc(idx, meta) {
+            if (docs.has(idx)) return docs.get(idx);
+            let d = '';
+            try {
+                d = vectorManager.buildVectorDocument(meta) || '';
+            } catch (_) {
+                d = '';
+            }
+            docs.set(idx, d);
+            return d;
+        },
+    };
+}
+
 /** 计算当前聊天中缺失/过期的向量索引数量（仅统计可索引消息） */
-function _countVectorIndexGap(chat) {
+function _countVectorIndexGap(chat, docCache = _makeVectorDocCache()) {
     if (!Array.isArray(chat) || chat.length === 0) return { missing: 0, indexable: 0 };
 
     let missing = 0;
@@ -16099,7 +16165,7 @@ function _countVectorIndexGap(chat) {
         const meta = msg.horae_meta;
         if (!meta || meta._skipHorae) continue;
 
-        const doc = vectorManager.buildVectorDocument(meta);
+        const doc = docCache.doc(i, meta);
         if (!doc) continue;
 
         indexable++;
@@ -16121,7 +16187,7 @@ function _countVectorIndexGap(chat) {
 }
 
 /** 清理向量索引中的不可追踪楼层（user/无meta/番外/无可索引文档） */
-async function _pruneVectorUntrackableEntries(chat) {
+async function _pruneVectorUntrackableEntries(chat, docCache = _makeVectorDocCache()) {
     if (!Array.isArray(chat) || vectorManager.vectors.size === 0) return 0;
 
     const staleIndices = [];
@@ -16130,7 +16196,7 @@ async function _pruneVectorUntrackableEntries(chat) {
         const meta = msg?.horae_meta;
         // 番外/小剧场和 carryover 种子楼层都不该留向量
         const excluded = !msg || msg.is_user || !meta || meta._skipHorae || meta._carryoverSeed;
-        const doc = excluded ? '' : vectorManager.buildVectorDocument(meta);
+        const doc = excluded ? '' : docCache.doc(idx, meta);
         if (!doc) staleIndices.push(idx);
     }
 
@@ -16162,9 +16228,11 @@ async function _ensureVectorIndexBeforeRecall() {
         _updateVectorStatus();
     }
 
-    await _pruneVectorUntrackableEntries(chat);
+    // 两趟扫描共用一次文档构建
+    const docCache = _makeVectorDocCache();
+    await _pruneVectorUntrackableEntries(chat, docCache);
 
-    const { missing, indexable } = _countVectorIndexGap(chat);
+    const { missing, indexable } = _countVectorIndexGap(chat, docCache);
     if (missing <= 0) return;
 
     showToast(`检测到 ${missing}/${indexable} 条向量索引缺失，正在补建索引。请勿切换或退出聊天。`, 'warning');

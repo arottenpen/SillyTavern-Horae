@@ -54,6 +54,7 @@ export class VectorManager {
             ]);
         }
         this.db = null;
+        this._persistRequested = false;
         this.chatId = null;
         this.vectors = new Map();
         this.isReady = false;
@@ -2446,6 +2447,30 @@ export class VectorManager {
     // IndexedDB
     // ========================================
 
+    /**
+     * 申请持久化存储。默认的 best-effort 配额在移动端浏览器会被系统回收，
+     * 表现为「隔一段时间没用就掉索引」。只申请一次，失败不影响任何功能。
+     * 注意：换酒馆地址＝换 origin，IndexedDB 本身就是另一份，这个申请救不了，
+     * 那种情况只能固定用同一个地址。
+     */
+    async _requestPersistentStorage() {
+        if (this._persistRequested) return;
+        this._persistRequested = true;
+        try {
+            if (!navigator.storage?.persist) return;
+            if (await navigator.storage.persisted?.()) {
+                console.log('[Horae Vector] 存储已是持久化状态');
+                return;
+            }
+            const granted = await navigator.storage.persist();
+            console.log(granted
+                ? '[Horae Vector] 已获得持久化存储授权，索引不会被系统自动回收'
+                : '[Horae Vector] 持久化存储申请被拒绝，索引仍可能被系统回收');
+        } catch (err) {
+            console.warn('[Horae Vector] 持久化存储申请失败:', err);
+        }
+    }
+
     async _openDB() {
         if (this.db) {
             try {
@@ -2457,6 +2482,8 @@ export class VectorManager {
                 this.db = null;
             }
         }
+        // 不 await：拿不到授权也不该挡住开库
+        this._requestPersistentStorage();
         return new Promise((resolve, reject) => {
             const req = indexedDB.open(DB_NAME, DB_VERSION);
             req.onupgradeneeded = (event) => {

@@ -84,13 +84,19 @@ const COUNTING_CLASSIFIERS = '个把条块张根口份枚只颗支件套双对�
 // 容器/批量单位：1箱 = 一箱(里面有很多)，不可省略
 // 度量单位(斤/L/kg等)：有实际计量意义，不可省略
 
+// 量词清理正则：命中路径在「每楼层 × 每物品」的内层循环里，必须预编译，
+// 否则 getLatestState 全量重放一次就会重新编译上万个 RegExp。
+const RE_ONE_CLASSIFIER = new RegExp(`[\\(（]1[${COUNTING_CLASSIFIERS}][\\)）]$`);
+const RE_BARE_CLASSIFIER = new RegExp(`[\\(（][${COUNTING_CLASSIFIERS}][\\)）]$`);
+const RE_NUM_UNIT = /[\(（][\d][\d\.\/]*[a-zA-Z\u4e00-\u9fff]*[\)）]$/;
+
 // 物品ID：3位数字左补零，如 001, 002, ...
 function padItemId(id) { return String(id).padStart(3, '0'); }
 
 export function getItemBaseName(name) {
     return name
-        .replace(/[\(（][\d][\d\.\/]*[a-zA-Z\u4e00-\u9fff]*[\)）]$/, '')  // 数字+任意单位
-        .replace(new RegExp(`[\\(（][${COUNTING_CLASSIFIERS}][\\)）]$`), '')  // 纯个体量词（AI错误格式）
+        .replace(RE_NUM_UNIT, '')  // 数字+任意单位
+        .replace(RE_BARE_CLASSIFIER, '')  // 纯个体量词（AI错误格式）
         .trim();
 }
 
@@ -111,6 +117,10 @@ class HoraeManager {
     constructor() {
         this.context = null;
         this.settings = null;
+        // getLatestState 批次缓存：只在 beginStateScope/endStateScope 之间生效。
+        // 不做自动失效——离开作用域即丢弃，避免任何跨回合脏读。
+        this._stateScopeDepth = 0;
+        this._stateScopeCache = new Map();
     }
 
     /** 初始化管理器 */
@@ -118,6 +128,26 @@ class HoraeManager {
         this.context = context;
         this.settings = settings;
         setCustomCalendar(settings?.customCalendar || null);
+    }
+
+    /**
+     * 开启一次状态聚合作用域。作用域内对同一 skipLast 的 getLatestState()
+     * 只全量重放一次，后续调用复用同一对象。
+     * 仅用于「一次刷新内多个只读消费方」的场景；可嵌套。
+     */
+    beginStateScope() {
+        this._stateScopeDepth++;
+    }
+
+    /** 关闭状态聚合作用域。深度归零时清空缓存。 */
+    endStateScope() {
+        this._stateScopeDepth = Math.max(0, this._stateScopeDepth - 1);
+        if (this._stateScopeDepth === 0) this._stateScopeCache.clear();
+    }
+
+    /** 作用域内手动失效（写入 horae_meta 后调用，当前实现未用到，留给后续写路径） */
+    invalidateStateScope() {
+        this._stateScopeCache.clear();
     }
 
     /** 获取 AI 输出语言代码 (zh-CN / zh-TW / en / ja / ko / ru) */
@@ -188,6 +218,15 @@ class HoraeManager {
 
     /** 聚合所有消息元数据，获取最新状态 */
     getLatestState(skipLast = 0) {
+        if (this._stateScopeDepth > 0 && this._stateScopeCache.has(skipLast)) {
+            return this._stateScopeCache.get(skipLast);
+        }
+        const result = this._computeLatestState(skipLast);
+        if (this._stateScopeDepth > 0) this._stateScopeCache.set(skipLast, result);
+        return result;
+    }
+
+    _computeLatestState(skipLast = 0) {
         const chat = this.getChat();
         const state = createEmptyMeta();
         state._previousLocation = '';
@@ -227,9 +266,9 @@ class HoraeManager {
                     // (1) 裸数字1 → 去掉
                     name = name.replace(/[\(（]1[\)）]$/, '').trim();
                     // 个体量词+数字1 → 去掉
-                    name = name.replace(new RegExp(`[\\(（]1[${COUNTING_CLASSIFIERS}][\\)）]$`), '').trim();
+                    name = name.replace(RE_ONE_CLASSIFIER, '').trim();
                     // 纯个体量词 → 去掉
-                    name = name.replace(new RegExp(`[\\(（][${COUNTING_CLASSIFIERS}][\\)）]$`), '').trim();
+                    name = name.replace(RE_BARE_CLASSIFIER, '').trim();
                     // 度量/容器单位保留
                     
                     // 数量为0视为消耗，自动删除
@@ -1452,8 +1491,8 @@ class HoraeManager {
                     
                     // 去掉无意义的数量标记
                     itemName = itemName.replace(/[\(（]1[\)）]$/, '').trim();
-                    itemName = itemName.replace(new RegExp(`[\\(（]1[${COUNTING_CLASSIFIERS}][\\)）]$`), '').trim();
-                    itemName = itemName.replace(new RegExp(`[\\(（][${COUNTING_CLASSIFIERS}][\\)）]$`), '').trim();
+                    itemName = itemName.replace(RE_ONE_CLASSIFIER, '').trim();
+                    itemName = itemName.replace(RE_BARE_CLASSIFIER, '').trim();
                     
                     const atIndex = rest.indexOf('@');
                     const itemInfo = {
@@ -4458,8 +4497,8 @@ class HoraeManager {
                 
                 // 去掉无意义的数量标记
                 itemName = itemName.replace(/[\(（]1[\)）]$/, '').trim();
-                itemName = itemName.replace(new RegExp(`[\\(（]1[${COUNTING_CLASSIFIERS}][\\)）]$`), '').trim();
-                itemName = itemName.replace(new RegExp(`[\\(（][${COUNTING_CLASSIFIERS}][\\)）]$`), '').trim();
+                itemName = itemName.replace(RE_ONE_CLASSIFIER, '').trim();
+                itemName = itemName.replace(RE_BARE_CLASSIFIER, '').trim();
                 
                 const atIndex = rest.indexOf('@');
                 const itemInfo = {
