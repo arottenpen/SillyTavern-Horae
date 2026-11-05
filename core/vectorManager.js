@@ -55,6 +55,8 @@ export class VectorManager {
         }
         this.db = null;
         this._persistRequested = false;
+        this._chatLoadGeneration = 0;
+        this._chatLoadPromise = null;
         this.chatId = null;
         this.vectors = new Map();
         this.isReady = false;
@@ -185,6 +187,8 @@ export class VectorManager {
     }
 
     async dispose() {
+        this._chatLoadGeneration++;
+        this._chatLoadPromise = null;
         await this._disposeWorker();
         this.vectors.clear();
         this.termCounts.clear();
@@ -247,6 +251,7 @@ export class VectorManager {
      * 切换聊天：加载对应 chatId 的向量索引
      */
     async loadChat(chatId, chat) {
+        const loadGeneration = ++this._chatLoadGeneration;
         this.chatId = chatId;
         this.vectors.clear();
         this.termCounts.clear();
@@ -254,44 +259,82 @@ export class VectorManager {
         this.snapshots = [];
         this.clearRecallCache('loadChat');
 
-        if (!chatId) return;
-
-        try {
-            await this._openDB();
-            await this._loadSnapshotsForChat(chatId);
-            const stored = await this._loadAllVectors();
-            const staleKeys = [];
-            for (const item of stored) {
-                // IndexedDB 反序列化偶发返回字符串型 messageIndex，统一为整数避免与 chat 索引比较失效
-                const normalizedIdx = this._normalizeMessageIndex(item.messageIndex);
-                if (normalizedIdx === null || normalizedIdx >= chat.length) {
-                    staleKeys.push(item.messageIndex);
-                    continue;
-                }
-                const meta = chat[normalizedIdx]?.horae_meta;
-                const doc = this.buildVectorDocument(meta);
-                if (!doc || this._hashString(doc) !== item.hash) {
-                    staleKeys.push(item.messageIndex);
-                    continue;
-                }
-                this.vectors.set(normalizedIdx, {
-                    vector: item.vector,
-                    hash: item.hash,
-                    document: item.document,
-                });
-                this._updateTermCounts(item.document, 1);
-                this.totalDocuments++;
-            }
-            if (staleKeys.length > 0) {
-                for (const idx of staleKeys) await this._deleteVector(idx);
-                console.log(`[Horae Vector] 清理了 ${staleKeys.length} 条过期/分支外向量`);
-            }
-            const snapCount = this.snapshots.reduce((a, s) => a + s.items.length, 0);
-            const snapTxt = snapCount > 0 ? ` (+${snapCount} 条历史记忆, ${this.snapshots.length} 份快照)` : '';
-            console.log(`[Horae Vector] 已加载 ${this.vectors.size} 条向量 (chatId: ${chatId})${snapTxt}`);
-        } catch (err) {
-            console.warn('[Horae Vector] 加载向量索引失败:', err);
+        if (!chatId) {
+            this._chatLoadPromise = null;
+            return;
         }
+
+        const loadPromise = (async () => {
+            try {
+                await this._openDB();
+                const snapshots = await this._loadSnapshotsForChat(chatId);
+                const stored = await this._loadAllVectors(chatId);
+                const loadedVectors = new Map();
+                let skippedCount = 0;
+                const currentChat = Array.isArray(chat) ? chat : [];
+
+                for (const item of stored) {
+                    // IndexedDB 反序列化偶发返回字符串型 messageIndex，统一为整数避免与 chat 索引比较失效
+                    const normalizedIdx = this._normalizeMessageIndex(item.messageIndex);
+                    if (normalizedIdx === null || normalizedIdx >= currentChat.length) {
+                        skippedCount++;
+                        continue;
+                    }
+                    const meta = currentChat[normalizedIdx]?.horae_meta;
+                    const doc = this.buildVectorDocument(meta);
+                    if (!doc || this._hashString(doc) !== item.hash) {
+                        skippedCount++;
+                        continue;
+                    }
+                    loadedVectors.set(normalizedIdx, {
+                        vector: item.vector,
+                        hash: item.hash,
+                        document: item.document,
+                    });
+                }
+
+                // CHAT_CHANGED 和初始化可能重叠；旧加载结果绝不能覆盖新聊天的内存索引。
+                if (loadGeneration !== this._chatLoadGeneration || this.chatId !== chatId) return;
+
+                this.vectors = loadedVectors;
+                this.termCounts.clear();
+                this.totalDocuments = 0;
+                for (const item of loadedVectors.values()) {
+                    this._updateTermCounts(item.document, 1);
+                    this.totalDocuments++;
+                }
+                this.snapshots = snapshots;
+
+                if (skippedCount > 0) {
+                    // 加载时聊天数据可能仍在恢复或更新。这里只跳过，不能删除 IndexedDB 真源；
+                    // 稳定后的缺失/变更项会由召回前自检重建并覆盖。
+                    console.log(`[Horae Vector] 跳过 ${skippedCount} 条当前无法校验的持久化向量（已保留原数据）`);
+                }
+                const snapCount = this.snapshots.reduce((a, s) => a + s.items.length, 0);
+                const snapTxt = snapCount > 0 ? ` (+${snapCount} 条历史记忆, ${this.snapshots.length} 份快照)` : '';
+                console.log(`[Horae Vector] 已加载 ${this.vectors.size} 条向量 (chatId: ${chatId})${snapTxt}`);
+            } catch (err) {
+                if (loadGeneration === this._chatLoadGeneration && this.chatId === chatId) {
+                    console.warn('[Horae Vector] 加载向量索引失败:', err);
+                }
+            }
+        })();
+
+        const loadRecord = { chatId, generation: loadGeneration, promise: loadPromise };
+        this._chatLoadPromise = loadRecord;
+        try {
+            await loadPromise;
+        } finally {
+            if (this._chatLoadPromise === loadRecord) this._chatLoadPromise = null;
+        }
+    }
+
+    async _waitForChatLoad(chatId) {
+        const pending = this._chatLoadPromise;
+        if (pending?.chatId === chatId) {
+            try { await pending.promise; } catch (_) { /* loadChat handles its own error */ }
+        }
+        return this.chatId === chatId;
     }
 
     // ========================================
@@ -364,7 +407,9 @@ export class VectorManager {
     // ========================================
 
     async addMessage(messageIndex, meta) {
-        if (!this.isReady || !this.chatId) return;
+        const operationChatId = this.chatId;
+        if (!this.isReady || !operationChatId) return;
+        if (!await this._waitForChatLoad(operationChatId)) return;
         if (isMetaExcluded(meta)) return;
 
         const idx = this._normalizeMessageIndex(messageIndex);
@@ -380,6 +425,7 @@ export class VectorManager {
         const text = this._prepareText(doc, false);
         const result = await this._embed([text]);
         if (!result || !result.vectors?.[0]) return;
+        if (this.chatId !== operationChatId) return;
 
         const vector = result.vectors[0];
 
@@ -391,11 +437,13 @@ export class VectorManager {
 
         this.vectors.set(idx, { vector, hash, document: doc });
         this._updateTermCounts(doc, 1);
-        await this._saveVector(idx, { vector, hash, document: doc });
+        await this._saveVector(idx, { vector, hash, document: doc }, operationChatId);
         this.clearRecallCache('addMessage');
     }
 
     async removeMessage(messageIndex) {
+        const operationChatId = this.chatId;
+        if (!operationChatId || !await this._waitForChatLoad(operationChatId)) return;
         const idx = this._normalizeMessageIndex(messageIndex);
         if (idx === null) return;
         const existing = this.vectors.get(idx);
@@ -404,7 +452,7 @@ export class VectorManager {
         this._updateTermCounts(existing.document, -1);
         this.totalDocuments--;
         this.vectors.delete(idx);
-        await this._deleteVector(idx);
+        await this._deleteVector(idx, operationChatId);
         this.clearRecallCache('removeMessage');
     }
 
@@ -413,7 +461,10 @@ export class VectorManager {
      * @returns {{ indexed: number, skipped: number }}
      */
     async batchIndex(chat, onProgress) {
-        if (!this.isReady || !this.chatId) return { indexed: 0, skipped: 0 };
+        const operationChatId = this.chatId;
+        if (!this.isReady || !operationChatId) return { indexed: 0, skipped: 0 };
+        if (!await this._waitForChatLoad(operationChatId)) return { indexed: 0, skipped: 0 };
+        if (!Array.isArray(chat)) return { indexed: 0, skipped: 0 };
 
         const tasks = [];
         for (let i = 0; i < chat.length; i++) {
@@ -433,13 +484,15 @@ export class VectorManager {
         const batchSize = this.isApiMode ? 64 : 16;
         let indexed = 0;
 
-        for (let b = 0; b < tasks.length; b += batchSize) {
+        batchLoop: for (let b = 0; b < tasks.length; b += batchSize) {
             const batch = tasks.slice(b, b + batchSize);
             const texts = batch.map(t => this._prepareText(t.document, false));
             const result = await this._embed(texts);
             if (!result?.vectors) continue;
+            if (this.chatId !== operationChatId) break;
 
             for (let j = 0; j < batch.length; j++) {
+                if (this.chatId !== operationChatId) break batchLoop;
                 const task = batch[j];
                 const vector = result.vectors[j];
                 if (!vector) continue;
@@ -457,7 +510,11 @@ export class VectorManager {
                     document: task.document,
                 });
                 this._updateTermCounts(task.document, 1);
-                await this._saveVector(task.messageIndex, { vector, hash: task.hash, document: task.document });
+                await this._saveVector(
+                    task.messageIndex,
+                    { vector, hash: task.hash, document: task.document },
+                    operationChatId
+                );
                 indexed++;
             }
 
@@ -471,10 +528,12 @@ export class VectorManager {
     }
 
     async clearIndex() {
+        const operationChatId = this.chatId;
+        if (operationChatId && !await this._waitForChatLoad(operationChatId)) return;
         this.vectors.clear();
         this.termCounts.clear();
         this.totalDocuments = 0;
-        if (this.chatId) await this._clearVectors();
+        if (operationChatId) await this._clearVectors(operationChatId);
         this.clearRecallCache('clearIndex');
     }
 
@@ -2515,16 +2574,17 @@ export class VectorManager {
         });
     }
 
-    async _saveVector(messageIndex, data) {
+    async _saveVector(messageIndex, data, chatId = this.chatId) {
+        if (!chatId) return;
         await this._openDB();
         const normalizedIdx = this._normalizeMessageIndex(messageIndex);
         if (normalizedIdx === null) return;
-        const key = `${this.chatId}_${normalizedIdx}`;
+        const key = `${chatId}_${normalizedIdx}`;
         return new Promise((resolve, reject) => {
             const tx = this.db.transaction(STORE_NAME, 'readwrite');
             tx.objectStore(STORE_NAME).put({
                 key,
-                chatId: this.chatId,
+                chatId,
                 messageIndex: normalizedIdx,
                 vector: data.vector,
                 hash: data.hash,
@@ -2535,22 +2595,24 @@ export class VectorManager {
         });
     }
 
-    async _loadAllVectors() {
+    async _loadAllVectors(chatId = this.chatId) {
+        if (!chatId) return [];
         await this._openDB();
         return new Promise((resolve, reject) => {
             const tx = this.db.transaction(STORE_NAME, 'readonly');
             const index = tx.objectStore(STORE_NAME).index('chatId');
-            const req = index.getAll(this.chatId);
+            const req = index.getAll(chatId);
             req.onsuccess = () => resolve(req.result || []);
             req.onerror = () => reject(req.error);
         });
     }
 
-    async _deleteVector(messageIndex) {
+    async _deleteVector(messageIndex, chatId = this.chatId) {
+        if (!chatId) return;
         await this._openDB();
         const normalizedIdx = this._normalizeMessageIndex(messageIndex);
         if (normalizedIdx === null) return;
-        const key = `${this.chatId}_${normalizedIdx}`;
+        const key = `${chatId}_${normalizedIdx}`;
         return new Promise((resolve, reject) => {
             const tx = this.db.transaction(STORE_NAME, 'readwrite');
             tx.objectStore(STORE_NAME).delete(key);
@@ -2559,13 +2621,14 @@ export class VectorManager {
         });
     }
 
-    async _clearVectors() {
+    async _clearVectors(chatId = this.chatId) {
+        if (!chatId) return;
         await this._openDB();
         return new Promise((resolve, reject) => {
             const tx = this.db.transaction(STORE_NAME, 'readwrite');
             const store = tx.objectStore(STORE_NAME);
             const index = store.index('chatId');
-            const req = index.openCursor(this.chatId);
+            const req = index.openCursor(chatId);
             req.onsuccess = () => {
                 const cursor = req.result;
                 if (cursor) {
@@ -2793,7 +2856,7 @@ export class VectorManager {
     }
 
     async _loadSnapshotsForChat(chatId) {
-        if (!chatId) return;
+        if (!chatId) return [];
         await this._openDB();
         const records = await new Promise((resolve, reject) => {
             const tx = this.db.transaction(SNAPSHOT_STORE, 'readonly');
@@ -2801,19 +2864,20 @@ export class VectorManager {
             req.onsuccess = () => resolve(req.result || []);
             req.onerror = () => reject(req.error);
         });
-        this.snapshots = records
+        let snapshots = records
             .map(r => this._buildSnapshotRuntime(r))
             .filter(Boolean);
         // 维度跟当前模型不一致的快照直接禁用（点积会失效），日志提示
         if (this.dimensions && this.isReady) {
-            const before = this.snapshots.length;
-            this.snapshots = this.snapshots.filter(s => {
+            const before = snapshots.length;
+            snapshots = snapshots.filter(s => {
                 if (s.dimensions === this.dimensions) return true;
                 console.warn(`[Horae Vector] 快照「${s.label || s.id}」维度 ${s.dimensions} 与当前模型 ${this.dimensions} 不一致，已跳过`);
                 return false;
             });
-            if (before !== this.snapshots.length) this.clearRecallCache('snapshot-dim-mismatch');
+            if (before !== snapshots.length) this.clearRecallCache('snapshot-dim-mismatch');
         }
+        return snapshots;
     }
 
     _buildSnapshotRuntime(record) {
