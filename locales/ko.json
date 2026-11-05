@@ -511,6 +511,7 @@
         "vectorBuildFailed": "인덱스 구축 실패: {{error}}",
         "vectorProcessing": "처리 중... {{current}}/{{total}}",
         "vectorScanDone": "스캔 완료! {{processed}}개 처리, {{skipped}}개 건너뜀",
+        "scanDiagnostics": "진단: 파싱 가능한 태그가 없는 AI 메시지 {{missingTags}}개, 숨김 상태 불일치 {{hidden}}개(복구 시도됨)",
         "vectorDownloading": "모델 다운로드 중... {{pct}}%",
         "vectorTestSuccess": "벡터 API 연결 성공! 차원: {{dim}}",
         "vectorTestFailed": "벡터 API 연결 테스트 실패: {{error}}",

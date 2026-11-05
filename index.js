@@ -2633,6 +2633,92 @@ function getSummaryMsgIndices(entry) {
 }
 
 /**
+ * 迁移旧自动摘要的稀疏覆盖范围：
+ * - 摘要 range 内的普通楼层都应进入 coveredIndices；
+ * - 除第一批外，把首个 AI 前紧邻的 USER 楼层归入本批；
+ * - 永不越过第一条有效事件 AI（开场区）、番外或其它摘要边界。
+ */
+function _normalizeAutoSummaryCoverage(chat) {
+    if (!Array.isArray(chat) || chat.length === 0) return 0;
+    const hideAnchor = _findAutoSummaryHideAnchor(chat);
+    if (hideAnchor === null) return 0;
+
+    const summaries = (chat[0]?.horae_meta?.autoSummaries || [])
+        .filter(s => s?.id && s.auto !== false && _normalizeSummaryDepth(s.depth) === 1)
+        .sort((a, b) => {
+            const ar = Array.isArray(a.range) ? Number(a.range[0]) : Number.MAX_SAFE_INTEGER;
+            const br = Array.isArray(b.range) ? Number(b.range[0]) : Number.MAX_SAFE_INTEGER;
+            return ar - br;
+        });
+    if (summaries.length === 0) return 0;
+
+    const claimedBy = new Map();
+    for (const s of summaries) {
+        for (const idx of getSummaryMsgIndices(s)) {
+            if (Number.isInteger(idx) && idx >= hideAnchor && idx < chat.length && !claimedBy.has(idx)) {
+                claimedBy.set(idx, s.id);
+            }
+        }
+    }
+
+    let changed = 0;
+    for (const s of summaries) {
+        const covered = new Set(
+            getSummaryMsgIndices(s)
+                .filter(i => Number.isInteger(i) && i >= hideAnchor && i < chat.length && !!chat[i])
+        );
+        const rangeStart = Array.isArray(s.range) ? Number(s.range[0]) : NaN;
+        const rangeEnd = Array.isArray(s.range) ? Number(s.range[1]) : NaN;
+
+        if (Number.isInteger(rangeStart) && Number.isInteger(rangeEnd)) {
+            const start = Math.max(hideAnchor, Math.min(rangeStart, rangeEnd));
+            const end = Math.min(chat.length - 1, Math.max(rangeStart, rangeEnd));
+            for (let i = start; i <= end; i++) {
+                if (!chat[i] || chat[i].horae_meta?._skipHorae) continue;
+                const owner = claimedBy.get(i);
+                if (owner && owner !== s.id) continue;
+                covered.add(i);
+                claimedBy.set(i, s.id);
+            }
+        }
+
+        const sortedBeforePrefix = [...covered].sort((a, b) => a - b);
+        let firstCovered = sortedBeforePrefix[0];
+        if (Number.isInteger(firstCovered)) {
+            for (let i = firstCovered - 1; i >= hideAnchor; i--) {
+                const msg = chat[i];
+                if (!msg || !msg.is_user || msg.horae_meta?._skipHorae) break;
+                const owner = claimedBy.get(i);
+                if (owner && owner !== s.id) break;
+                covered.add(i);
+                claimedBy.set(i, s.id);
+                firstCovered = i;
+            }
+        }
+
+        const normalized = [...covered].sort((a, b) => a - b);
+        const previous = Array.isArray(s.coveredIndices)
+            ? [...new Set(s.coveredIndices.filter(Number.isInteger))].sort((a, b) => a - b)
+            : [];
+        const sameCoverage = normalized.length === previous.length
+            && normalized.every((idx, i) => idx === previous[i]);
+        if (!sameCoverage) {
+            s.coveredIndices = normalized;
+            changed++;
+        }
+        if (normalized.length > 0) {
+            const normalizedRange = [normalized[0], normalized[normalized.length - 1]];
+            if (!Array.isArray(s.range) || s.range[0] !== normalizedRange[0] || s.range[1] !== normalizedRange[1]) {
+                s.range = normalizedRange;
+                changed++;
+            }
+        }
+    }
+
+    return changed;
+}
+
+/**
  * 记录当前 chat 数组的浅拷贝（保留对每条 message 对象的引用）
  * 用于下一次 onMessageDeleted 触发时识别哪些楼层被删除
  */
@@ -10078,20 +10164,43 @@ function cleanOrphanSummaries() {
  * 防止 SillyTavern 重渲染或 saveChat 竞态导致隐藏/压缩标记丢失。
  * 会先「补回」缺失的摘要卡片（不再 deactivate），再对仍然有效的摘要补全标记。
  */
+function _collectAutoSummaryHiddenMismatches(chat) {
+    if (!Array.isArray(chat) || chat.length === 0) return [];
+    const hideAnchor = _findAutoSummaryHideAnchor(chat);
+    if (hideAnchor === null) return [];
+    _normalizeAutoSummaryCoverage(chat);
+
+    const expected = new Set();
+    for (const s of (chat[0]?.horae_meta?.autoSummaries || [])) {
+        if (!s?.id || s.active === false) continue;
+        for (const idx of getSummaryMsgIndices(s)) {
+            if (Number.isInteger(idx) && idx >= hideAnchor && chat[idx] && !chat[idx].horae_meta?._skipHorae) {
+                expected.add(idx);
+            }
+        }
+    }
+    for (let i = hideAnchor; i < chat.length; i++) {
+        if (chat[i]?.horae_meta?._autoBufferHidden && !chat[i].horae_meta?._skipHorae) expected.add(i);
+    }
+    return [...expected].filter(i => !chat[i]?.is_system).sort((a, b) => a - b);
+}
+
 async function enforceHiddenState() {
     const chat = horaeManager.getChat();
     if (!chat?.length) return;
-    const sums = chat[0]?.horae_meta?.autoSummaries;
-    if (!sums?.length) return;
+    const hideAnchor = _findAutoSummaryHideAnchor(chat);
+    if (hideAnchor === null) return;
+    const sums = chat[0]?.horae_meta?.autoSummaries || [];
+    const normalizedCoverage = _normalizeAutoSummaryCoverage(chat);
 
-    const cardsRestored = cleanOrphanSummaries();
+    const cardsRestored = sums.length > 0 ? cleanOrphanSummaries() : 0;
 
-    let fixed = 0;
+    let fixed = normalizedCoverage;
     for (const s of sums) {
         if (!s.active) continue;
         const summaryId = s.id;
         for (const i of getSummaryMsgIndices(s)) {
-            if (i === 0 || !chat[i]) continue;
+            if (i < hideAnchor || !chat[i] || chat[i].horae_meta?._skipHorae) continue;
             if (!chat[i].is_hidden || !chat[i].is_system) {
                 chat[i].is_hidden = true;
                 // 提示词过滤只认 is_system，只补 is_hidden 修不回已经漂移的楼层
@@ -10109,6 +10218,15 @@ async function enforceHiddenState() {
             }
         }
     }
+    for (let i = hideAnchor; i < chat.length; i++) {
+        const msg = chat[i];
+        if (!msg?.horae_meta?._autoBufferHidden || msg.horae_meta._skipHorae) continue;
+        if (!msg.is_hidden || !msg.is_system) {
+            msg.is_hidden = true;
+            _applyNativeHiddenState(chat, i, true);
+            fixed++;
+        }
+    }
     if (fixed > 0 || cardsRestored > 0) {
         console.log(`[Horae] enforceHiddenState: 修复 ${fixed} 处隐藏/压缩状态, 自动补回 ${cardsRestored} 张缺失摘要卡片`);
         await getContext().saveChat();
@@ -10122,17 +10240,19 @@ async function enforceHiddenState() {
 function repairAllSummaryStates() {
     const chat = horaeManager.getChat();
     if (!chat?.length) return 0;
-    const sums = chat[0]?.horae_meta?.autoSummaries;
-    if (!sums?.length) return 0;
+    const hideAnchor = _findAutoSummaryHideAnchor(chat);
+    if (hideAnchor === null) return 0;
+    const sums = chat[0]?.horae_meta?.autoSummaries || [];
+    const normalizedCoverage = _normalizeAutoSummaryCoverage(chat);
 
-    const cardsRestored = cleanOrphanSummaries();
+    const cardsRestored = sums.length > 0 ? cleanOrphanSummaries() : 0;
 
-    let fixed = 0;
+    let fixed = normalizedCoverage;
     for (const s of sums) {
         if (!s.active) continue;
         const summaryId = s.id;
         for (const i of getSummaryMsgIndices(s)) {
-            if (i === 0 || !chat[i]) continue;
+            if (i < hideAnchor || !chat[i] || chat[i].horae_meta?._skipHorae) continue;
             if (!chat[i].is_hidden || !chat[i].is_system) {
                 chat[i].is_hidden = true;
                 // 提示词过滤只认 is_system，只补 is_hidden 修不回已经漂移的楼层
@@ -10148,6 +10268,15 @@ function repairAllSummaryStates() {
                     }
                 }
             }
+        }
+    }
+    for (let i = hideAnchor; i < chat.length; i++) {
+        const msg = chat[i];
+        if (!msg?.horae_meta?._autoBufferHidden || msg.horae_meta._skipHorae) continue;
+        if (!msg.is_hidden || !msg.is_system) {
+            msg.is_hidden = true;
+            _applyNativeHiddenState(chat, i, true);
+            fixed++;
         }
     }
     if (fixed > 0 || cardsRestored > 0) {
@@ -16456,9 +16585,22 @@ async function scanHistoryWithProgress() {
         horaeManager.rebuildLocationMemory();
         horaeManager.rebuildRpgData();
 
+        const chat = horaeManager.getChat();
+        const hiddenMismatches = _collectAutoSummaryHiddenMismatches(chat);
+        await enforceHiddenState();
         await getContext().saveChat();
 
         showToast(t('toast.vectorScanDone', { processed: result.processed, skipped: result.skipped }), 'success');
+        const missingTagIndices = result.missingTagIndices || [];
+        if (missingTagIndices.length > 0 || hiddenMismatches.length > 0) {
+            console.warn(
+                `[Horae] 标签/隐藏诊断：缺少可解析标签=${missingTagIndices.join(',') || 'none'}；隐藏状态不一致=${hiddenMismatches.join(',') || 'none'}`
+            );
+            showToast(t('toast.scanDiagnostics', {
+                missingTags: missingTagIndices.length,
+                hidden: hiddenMismatches.length,
+            }), 'warning');
+        }
         refreshAllDisplays();
         renderCustomTablesList();
     } catch (error) {
@@ -17855,6 +17997,44 @@ function _isTrackableAiMessage(msg) {
     return true;
 }
 
+function _hasValidOriginalAutoSummaryEvent(msg) {
+    if (!_isTrackableAiMessage(msg)) return false;
+    const meta = msg.horae_meta;
+    const events = Array.isArray(meta?.events)
+        ? meta.events
+        : (meta?.event ? [meta.event] : []);
+    return events.some(evt =>
+        !!evt?.summary
+        && !evt.isSummary
+        && !evt._summaryId
+        && !evt._carryoverSeed
+    );
+}
+
+/** 第一条有效事件 AI 是自动隐藏锚点；它之前的开场楼层永久保留。 */
+function _findAutoSummaryHideAnchor(chat) {
+    if (!Array.isArray(chat)) return null;
+    for (let i = 0; i < chat.length; i++) {
+        if (_hasValidOriginalAutoSummaryEvent(chat[i])) return i;
+    }
+    return null;
+}
+
+/**
+ * 后续摘要批次要接住首个 AI 前紧邻的 USER，避免批次/摘要边界漏一层；
+ * 第一批不能越过隐藏锚点，也不能跨番外或已有摘要覆盖范围。
+ */
+function _resolveAutoSummaryBatchStart(chat, firstEventIndex, hideAnchor, activeSummaryCoveredIndices) {
+    let start = Math.max(hideAnchor, firstEventIndex);
+    for (let i = start - 1; i >= hideAnchor; i--) {
+        const msg = chat[i];
+        if (!msg || !msg.is_user) break;
+        if (msg.horae_meta?._skipHorae || activeSummaryCoveredIndices?.has(i)) break;
+        start = i;
+    }
+    return start;
+}
+
 function _resolveAutoSummaryKeepWindow(chat, keepRecent) {
     if (!Array.isArray(chat) || chat.length <= 1) {
         return { keepStart: 0, totalAi: 0, keepAiIndices: [], allAiIndices: [] };
@@ -17907,11 +18087,12 @@ function _collectActiveSummaryCoveredIndices(chat) {
     return covered;
 }
 
-function _buildAutoSummaryBufferHideIndices(chat, keepStart, tailAiIndices, activeSummaryCoveredIndices) {
+function _buildAutoSummaryBufferHideIndices(chat, hideAnchor, keepStart, tailAiIndices, activeSummaryCoveredIndices) {
     if (!Array.isArray(chat) || chat.length <= 1) return [];
     if (!Array.isArray(tailAiIndices) || tailAiIndices.length === 0) return [];
+    if (!Number.isInteger(hideAnchor)) return [];
 
-    const start = Math.max(0, Math.min(...tailAiIndices));
+    const start = Math.max(0, hideAnchor);
     const end = Math.min(Math.max(0, keepStart) - 1, chat.length - 1);
     if (end < start) return [];
 
@@ -17966,6 +18147,8 @@ async function _syncAutoSummaryBufferHidden(chat, targetHideIndices, activeSumma
 
 async function _reconcileAutoBufferVisibilityByKeepRecent(chat = horaeManager.getChat()) {
     if (!Array.isArray(chat) || chat.length <= 1) return;
+    _normalizeAutoSummaryCoverage(chat);
+    const hideAnchor = _findAutoSummaryHideAnchor(chat);
     const keepRecent = Math.max(0, parseInt(settings.autoSummaryKeepRecent, 10) || 10);
     const keepWindow = _resolveAutoSummaryKeepWindow(chat, keepRecent);
     const summarizedIndices = _collectActiveSummaryCoveredIndices(chat);
@@ -17979,6 +18162,7 @@ async function _reconcileAutoBufferVisibilityByKeepRecent(chat = horaeManager.ge
 
     const targetHideIndices = _buildAutoSummaryBufferHideIndices(
         chat,
+        hideAnchor,
         keepWindow.keepStart,
         tailAiIndices,
         summarizedIndices
@@ -18026,6 +18210,8 @@ async function checkAutoSummary() {
 
         const keepWindow = _resolveAutoSummaryKeepWindow(chat, keepRecent);
         const cutoff = Math.max(0, Math.min(keepWindow.keepStart, chat.length));
+        const hideAnchor = _findAutoSummaryHideAnchor(chat);
+        _normalizeAutoSummaryCoverage(chat);
 
         // 独立检查：当同层摘要达到阈值时，自动进行更高层级再总结（可级联）
         await _runAutoResummaryIfNeeded(chat, cutoff);
@@ -18070,6 +18256,7 @@ async function checkAutoSummary() {
         const activeSummaryCoveredIndices = _collectActiveSummaryCoveredIndices(chat);
         const targetHideIndices = _buildAutoSummaryBufferHideIndices(
             chat,
+            hideAnchor,
             keepWindow.keepStart,
             tailAiIndices,
             activeSummaryCoveredIndices
@@ -18113,7 +18300,12 @@ async function checkAutoSummary() {
         const batchEventMsgIndices = [...batchEventIndices].sort((a, b) => a - b);
         let batchIndices = [...batchEventMsgIndices];
         if (batchEventMsgIndices.length > 0) {
-            const batchStart = batchEventMsgIndices[0];
+            const batchStart = _resolveAutoSummaryBatchStart(
+                chat,
+                batchEventMsgIndices[0],
+                hideAnchor,
+                activeSummaryCoveredIndices
+            );
             const batchEnd = batchEventMsgIndices[batchEventMsgIndices.length - 1];
             const expanded = [];
             for (let i = batchStart; i <= batchEnd; i++) {

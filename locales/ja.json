@@ -513,6 +513,7 @@
         "vectorBuildFailed": "インデックス構築に失敗しました：{{error}}",
         "vectorProcessing": "処理中... {{current}}/{{total}}",
         "vectorScanDone": "スキャン完了！{{processed}}件処理、{{skipped}}件スキップ",
+        "scanDiagnostics": "診断：解析可能なタグがないAIメッセージ {{missingTags}}件、非表示状態の不一致 {{hidden}}件（修復を試行済み）",
         "vectorDownloading": "モデルをダウンロード中... {{pct}}%",
         "vectorTestSuccess": "ベクトルAPI接続成功！次元数：{{dim}}",
         "vectorTestFailed": "ベクトルAPI接続テスト失敗：{{error}}",

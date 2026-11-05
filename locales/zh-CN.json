@@ -507,6 +507,7 @@
         "vectorBuildFailed": "构建索引失败: {{error}}",
         "vectorProcessing": "处理中... {{current}}/{{total}}",
         "vectorScanDone": "扫描完成！处理 {{processed}} 条，跳过 {{skipped}} 条",
+        "scanDiagnostics": "诊断：{{missingTags}} 条 AI 消息缺少可解析标签，{{hidden}} 层隐藏状态不一致（已尝试修复）",
         "vectorDownloading": "下载模型... {{pct}}%",
         "vectorTestSuccess": "向量 API 连接成功！维度 {{dim}}",
         "vectorTestFailed": "向量 API 连接失败: {{error}}",

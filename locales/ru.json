@@ -507,6 +507,7 @@
         "vectorBuildFailed": "Ошибка построения индекса: {{error}}",
         "vectorProcessing": "Обработка... {{current}}/{{total}}",
         "vectorScanDone": "Сканирование завершено! {{processed}} обработано, {{skipped}} пропущено",
+        "scanDiagnostics": "Диагностика: у {{missingTags}} сообщений AI нет распознаваемых тегов; {{hidden}} состояний скрытия не совпали (выполнена попытка исправления)",
         "vectorDownloading": "Скачивание модели... {{pct}}%",
         "vectorTestSuccess": "Векторное API подключено! Размерность: {{dim}}",
         "vectorTestFailed": "Тест векторного API не удался: {{error}}",

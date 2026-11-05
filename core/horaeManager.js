@@ -3398,6 +3398,7 @@ class HoraeManager {
         const chat = this.getChat();
         let processed = 0;
         let skipped = 0;
+        const missingTagIndices = [];
 
         const PRESERVE_KEYS = [
             'autoSummaries', 'customTables', 'globalTableData', 'charTableData',
@@ -3495,9 +3496,13 @@ class HoraeManager {
                     console.error(`[Horae] 分析消息 #${i} 失败:`, error);
                 }
             } else {
-                const meta = createEmptyMeta();
-                _applyPreserved(meta);
-                this.setMessageMeta(i, meta);
+                if (!wasSkipped) missingTagIndices.push(i);
+                // “扫描标签”是诊断/回填，不应因原文标签暂时缺失而清空已有元数据。
+                if (!existing) {
+                    const meta = createEmptyMeta();
+                    _applyPreserved(meta);
+                    this.setMessageMeta(i, meta);
+                }
                 processed++;
             }
 
@@ -3506,7 +3511,7 @@ class HoraeManager {
             }
         }
 
-        return { processed, skipped };
+        return { processed, skipped, missingTagIndices };
     }
 
     generateSystemPromptAddition() {

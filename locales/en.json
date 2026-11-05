@@ -507,6 +507,7 @@
         "vectorBuildFailed": "Index build failed: {{error}}",
         "vectorProcessing": "Processing... {{current}}/{{total}}",
         "vectorScanDone": "Scan complete! {{processed}} processed, {{skipped}} skipped",
+        "scanDiagnostics": "Diagnostics: {{missingTags}} AI messages lack parseable tags; {{hidden}} hidden states were inconsistent (repair attempted)",
         "vectorDownloading": "Downloading model... {{pct}}%",
         "vectorTestSuccess": "Vector API connected! Dimensions: {{dim}}",
         "vectorTestFailed": "Vector API test failed: {{error}}",
