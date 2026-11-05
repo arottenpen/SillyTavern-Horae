@@ -21023,6 +21023,37 @@ function _isLikelySameChatMessage(chatMes, promptContent) {
     return false;
 }
 
+/** 从尾部按 role+内容对位原始 chat 与最终 prompt，避免命中预设中的示例对话。 */
+function _mapChatIndicesToPrompt(chat, promptChat) {
+    const mapped = new Map();
+    if (!Array.isArray(chat) || !Array.isArray(promptChat) || chat.length === 0 || promptChat.length === 0) {
+        return mapped;
+    }
+
+    let p = promptChat.length - 1;
+    for (let c = chat.length - 1; c >= 0 && p >= 0; c--) {
+        const msg = chat[c];
+        if (!msg || typeof msg.is_user !== 'boolean') continue;
+
+        const expectedRole = msg.is_user ? 'user' : 'assistant';
+        let found = -1;
+        for (let i = p; i >= 0; i--) {
+            const row = promptChat[i];
+            if (!row || (row.role !== 'user' && row.role !== 'assistant')) continue;
+            if (row.role !== expectedRole) continue;
+            if (_isLikelySameChatMessage(msg.mes || '', row.content || '')) {
+                found = i;
+                break;
+            }
+        }
+        if (found !== -1) {
+            mapped.set(c, found);
+            p = found - 1;
+        }
+    }
+    return mapped;
+}
+
 /**
  * 旧策略：仅按 eventData.chat 中 user/assistant 倒序计数
  */
@@ -21074,29 +21105,7 @@ function _resolveInsertIndexByChatAnchor(chat, promptChat, position) {
         : (turnChatIndices.length - position);
     const targetChatIdx = targetListPos >= 0 ? turnChatIndices[targetListPos] : turnChatIndices[0];
 
-    // 从尾部开始做 role+内容匹配，避免误把前置示例对话当成真实 chat
-    const mapped = new Map(); // chatIndex -> promptIndex
-    let p = promptChat.length - 1;
-    for (let c = chat.length - 1; c >= 0 && p >= 0; c--) {
-        const msg = chat[c];
-        if (!msg || typeof msg.is_user !== 'boolean') continue;
-
-        const expectedRole = msg.is_user ? 'user' : 'assistant';
-        let found = -1;
-        for (let i = p; i >= 0; i--) {
-            const row = promptChat[i];
-            if (!row || (row.role !== 'user' && row.role !== 'assistant')) continue;
-            if (row.role !== expectedRole) continue;
-            if (_isLikelySameChatMessage(msg.mes || '', row.content || '')) {
-                found = i;
-                break;
-            }
-        }
-        if (found !== -1) {
-            mapped.set(c, found);
-            p = found - 1;
-        }
-    }
+    const mapped = _mapChatIndicesToPrompt(chat, promptChat);
 
     if (mapped.size === 0) {
         return _resolveInsertIndexByPromptTurns(promptChat, position);
@@ -21126,33 +21135,7 @@ function _resolveInsertIndexByChatAnchor(chat, promptChat, position) {
  * 通过从尾部开始的 role+内容匹配，将 eventData.chat 对位回原始 chat。
  */
 function _collectPromptCoveredChatIndices(chat, promptChat) {
-    const covered = new Set();
-    if (!Array.isArray(chat) || !Array.isArray(promptChat) || chat.length === 0 || promptChat.length === 0) {
-        return covered;
-    }
-
-    let p = promptChat.length - 1;
-    for (let c = chat.length - 1; c >= 0 && p >= 0; c--) {
-        const msg = chat[c];
-        if (!msg || typeof msg.is_user !== 'boolean') continue;
-
-        const expectedRole = msg.is_user ? 'user' : 'assistant';
-        let found = -1;
-        for (let i = p; i >= 0; i--) {
-            const row = promptChat[i];
-            if (!row || (row.role !== 'user' && row.role !== 'assistant')) continue;
-            if (row.role !== expectedRole) continue;
-            if (_isLikelySameChatMessage(msg.mes || '', row.content || '')) {
-                found = i;
-                break;
-            }
-        }
-        if (found !== -1) {
-            covered.add(c);
-            p = found - 1;
-        }
-    }
-    return covered;
+    return new Set(_mapChatIndicesToPrompt(chat, promptChat).keys());
 }
 
 /** 注入上下文（数据+规则合并注入） */
@@ -21228,6 +21211,82 @@ function _resolveTimelineInsertIndexByStartMarker(promptChat) {
         return { mode: 'insert', index: markerIndices[0] + 1 };
     }
     return null;
+}
+
+const HORAE_INTERNAL_TIMELINE_ANCHOR = '[HORAE_INTERNAL:TIMELINE_ANCHOR]';
+
+/**
+ * 取出 Horae 自己注入的剧情轨迹定位符并返回原索引。
+ * 一进入 prompt 处理就移除，确保任何提前返回路径都不会把内部标记发给模型。
+ */
+function _takeInternalTimelineAnchor(promptChat) {
+    if (!Array.isArray(promptChat) || promptChat.length === 0) return null;
+    let anchorIndex = null;
+    for (let i = promptChat.length - 1; i >= 0; i--) {
+        const row = promptChat[i];
+        if (!row || row.role !== 'system' || typeof row.content !== 'string') continue;
+        if (row.content.trim() !== HORAE_INTERNAL_TIMELINE_ANCHOR) continue;
+        anchorIndex = i;
+        promptChat.splice(i, 1);
+    }
+    return anchorIndex;
+}
+
+/**
+ * 独立剧情轨迹放在首个完整事件回合之后：
+ * - 首条有效事件 AI 仍可见时，紧跟在该 AI 后面，避免拆开 USER→AI；
+ * - 该 AI 已隐藏时，放到其后第一条仍可见消息之前；
+ * - 后续消息也不存在时，接在最后一条可见开场消息之后。
+ */
+function _resolveTimelineInsertIndexByOpeningTurn(chat, promptChat) {
+    const anchor = _findAutoSummaryHideAnchor(chat);
+    if (!Number.isInteger(anchor)) return null;
+
+    const mapped = _mapChatIndicesToPrompt(chat, promptChat);
+    if (mapped.size === 0) return null;
+    if (mapped.has(anchor)) {
+        return Math.min(mapped.get(anchor) + 1, promptChat.length);
+    }
+
+    const mappedPairs = [...mapped.entries()].sort((a, b) => a[0] - b[0]);
+    const firstAfterAnchor = mappedPairs.find(([chatIndex]) => chatIndex > anchor);
+    if (firstAfterAnchor) return firstAfterAnchor[1];
+
+    for (let i = mappedPairs.length - 1; i >= 0; i--) {
+        const [chatIndex, promptIndex] = mappedPairs[i];
+        if (chatIndex < anchor) return Math.min(promptIndex + 1, promptChat.length);
+    }
+    return null;
+}
+
+/** 注入独立剧情轨迹；开场回合对位失败时沿用内部锚点、Start marker 与超深度兜底。 */
+function _injectSeparateTimelinePrompt(chat, promptChat, timelinePrompt, fallbackAnchorIndex = null) {
+    const openingTurnIndex = _resolveTimelineInsertIndexByOpeningTurn(chat, promptChat);
+    if (Number.isInteger(openingTurnIndex)) {
+        promptChat.splice(openingTurnIndex, 0, { role: 'system', content: timelinePrompt });
+        return 'after opening event turn';
+    }
+
+    if (Number.isInteger(fallbackAnchorIndex)) {
+        const insertIndex = Math.max(0, Math.min(fallbackAnchorIndex, promptChat.length));
+        promptChat.splice(insertIndex, 0, { role: 'system', content: timelinePrompt });
+        return 'at internal fallback anchor';
+    }
+
+    const markerAction = _resolveTimelineInsertIndexByStartMarker(promptChat);
+    if (markerAction?.mode === 'replace') {
+        promptChat[markerAction.index].content = timelinePrompt;
+        return 'replaced fallback Start marker';
+    }
+    if (markerAction?.mode === 'insert') {
+        promptChat.splice(markerAction.index, 0, { role: 'system', content: timelinePrompt });
+        return 'after fallback Start marker';
+    }
+
+    const timelineDepth = 99999;
+    const timelineIndex = _resolveInsertIndexByChatAnchor(chat, promptChat, timelineDepth);
+    promptChat.splice(timelineIndex, 0, { role: 'system', content: timelinePrompt });
+    return `at fallback depth -${timelineDepth}`;
 }
 
 const HORAE_INTERNAL_NO_VECTOR_RECALL_PREFIX = '[HORAE_INTERNAL:NO_VECTOR_RECALL:';
@@ -21332,6 +21391,7 @@ function _antiParaphraseSnippets() {
 async function onPromptReady(eventData) {
     const skipVectorRecallOnce = _stripNoVectorRecallMarkers(eventData?.chat);
     const skipContextInjectionOnce = _stripNoContextInjectionMarkers(eventData?.chat);
+    const internalTimelineAnchorIndex = _takeInternalTimelineAnchor(eventData?.chat);
     if (_isSummaryGeneration) return;
     if (skipContextInjectionOnce) {
         console.log('[Horae] Internal no-context marker detected, skip Horae context injection for this request');
@@ -21440,46 +21500,25 @@ async function onPromptReady(eventData) {
         const position = Number.isNaN(positionRaw) ? 1 : Math.max(0, positionRaw);
         const depthSource = settings.injectionDepthSource === 'preset' ? 'preset' : 'system';
 
+        if (timelinePrompt) {
+            const placement = _injectSeparateTimelinePrompt(
+                chat,
+                eventData.chat,
+                timelinePrompt,
+                internalTimelineAnchorIndex,
+            );
+            const sourceLabel = depthSource === 'preset' ? ' (preset@D)' : '';
+            console.log(`[Horae] Story timeline injected ${placement}${sourceLabel}${skipLast ? ' (skip last message)' : ''}`);
+        }
+
         if (depthSource === 'preset') {
             // 预设 @D：不按聊天楼层定位，直接按完整提示词末尾偏移插入
-            if (timelinePrompt) {
-                // 剧情轨迹保持与系统 @D 相同的定位逻辑
-                const markerAction = _resolveTimelineInsertIndexByStartMarker(eventData.chat);
-                if (markerAction?.mode === 'replace') {
-                    eventData.chat[markerAction.index].content = timelinePrompt;
-                    console.log(`[Horae] Story timeline replaced the 2nd [Start a new Chat] marker (preset@D)${skipLast ? ' (skip last message)' : ''}`);
-                } else if (markerAction?.mode === 'insert') {
-                    eventData.chat.splice(markerAction.index, 0, { role: 'system', content: timelinePrompt });
-                    console.log(`[Horae] Story timeline injected after [Start a new Chat] (preset@D)${skipLast ? ' (skip last message)' : ''}`);
-                } else {
-                    const timelineDepth = 99999;
-                    const timelineIdx = _resolveInsertIndexByChatAnchor(chat, eventData.chat, timelineDepth);
-                    eventData.chat.splice(timelineIdx, 0, { role: 'system', content: timelinePrompt });
-                    console.log(`[Horae] Start marker not found, fallback timeline injection at depth -${timelineDepth} (preset@D)${skipLast ? ' (skip last message)' : ''}`);
-                }
-            }
             const len = Array.isArray(eventData.chat) ? eventData.chat.length : 0;
             const insertIdx = Math.max(0, len - position);
             eventData.chat.splice(insertIdx, 0, { role: 'system', content: combinedPrompt });
             console.log(`[Horae] 已注入上下文（预设@D），位置: -${position}${skipLast ? '（已跳过末尾消息）' : ''}${recallPrompt ? '（含向量召回）' : ''}`);
         } else {
             // 系统 @D：保留原有按聊天楼层定位的注入逻辑
-            if (timelinePrompt) {
-                const markerAction = _resolveTimelineInsertIndexByStartMarker(eventData.chat);
-                if (markerAction?.mode === 'replace') {
-                    eventData.chat[markerAction.index].content = timelinePrompt;
-                    console.log(`[Horae] Story timeline replaced the 2nd [Start a new Chat] marker${skipLast ? ' (skip last message)' : ''}`);
-                } else if (markerAction?.mode === 'insert') {
-                    eventData.chat.splice(markerAction.index, 0, { role: 'system', content: timelinePrompt });
-                    console.log(`[Horae] Story timeline injected after [Start a new Chat]${skipLast ? ' (skip last message)' : ''}`);
-                } else {
-                    const timelineDepth = 99999;
-                    const timelineIdx = _resolveInsertIndexByChatAnchor(chat, eventData.chat, timelineDepth);
-                    eventData.chat.splice(timelineIdx, 0, { role: 'system', content: timelinePrompt });
-                    console.log(`[Horae] Start marker not found, fallback timeline injection at depth -${timelineDepth}${skipLast ? ' (skip last message)' : ''}`);
-                }
-            }
-
             const insertIdx = _resolveInsertIndexByChatAnchor(chat, eventData.chat, position);
             eventData.chat.splice(insertIdx, 0, { role: 'system', content: combinedPrompt });
             console.log(`[Horae] 已注入上下文，位置: -${position}${skipLast ? '（已跳过末尾消息）' : ''}${recallPrompt ? '（含向量召回）' : ''}`);
@@ -21981,15 +22020,21 @@ jQuery(async () => {
     eventSource.on(event_types.MESSAGE_EDITED, onMessageEdited);
 
     eventSource.on(event_types.GENERATION_AFTER_COMMANDS, () => {
+        if (!settings.enabled
+            || !settings.injectContext
+            || settings.timelineInjectionMode !== 'separate'
+            || settings.sendTimeline === false) {
+            return;
+        }
         TavernHelper.injectPrompts([
             {
-                id: "test_prompt_once",
+                id: "horae_timeline_anchor_once",
                 position: "in_chat",
                 depth: 9999,
                 role: "system",
-                content: "[Start a new Chat]"
+                content: HORAE_INTERNAL_TIMELINE_ANCHOR
             }
-        ], { once: true }); // 在D9999注入一个定位符
+        ], { once: true }); // 在 D9999 放置内部兜底锚点；onPromptReady 会先取出，绝不发送给模型
     });
 
     // 并行自动摘要：用户发消息时并行触发（独立API走直接HTTP，不影响主连接）
