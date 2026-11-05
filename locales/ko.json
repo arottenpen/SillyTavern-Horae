@@ -303,7 +303,7 @@
         "antiParaphrase": "반의역 모드",
         "antiParaphraseHint": "USER가 직접 행동을 작성하는 플레이 스타일용. AI의 <horae> 태그가 이전 USER 메시지도 고려합니다.",
         "sideplayMode": "사이드 스토리 / 미니 극장",
-        "sideplayModeHint": "'사이드 스토리로 표시' 버튼을 추가합니다. 표시된 메시지는 Horae가 추적하지 않으며 자동 요약에 포함되지 않습니다.",
+        "sideplayModeHint": "'사이드 스토리로 표시' 버튼을 추가합니다. AI 메시지를 표시하면 바로 앞의 사용자 메시지도 Horae 추적 및 자동 요약에서 함께 제외됩니다.",
         "autoSummary": "자동 요약 및 숨기기",
         "autoSummaryHint": "요약되지 않은 콘텐츠가 트리거 임계값에 도달하면 오래된 이벤트를 AI 요약으로 자동 압축해 토큰을 절약합니다.\n압축된 요약은 원본 이벤트로 다시 펼칠 수 있습니다.",
         "enableAutoSummary": "자동 요약 활성화",

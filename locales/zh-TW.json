@@ -299,7 +299,7 @@
         "antiParaphrase": "反轉述模式",
         "antiParaphraseHint": "適用於「USER自己描寫行為/動作，AI不再轉述USER部分」的寫法。開啟後，AI回覆時會將上一條USER訊息的內容也納入本條<horae>標籤的結算，確保USER的行為不遺漏。",
         "sideplayMode": "番外/小劇場模式",
-        "sideplayModeHint": "啟用後，底部面板會出現「標記為番外」按鈕。被標記的訊息不會被Horae追蹤、不參與自動總結，適合在主線中穿插if/番外/小劇場。",
+        "sideplayModeHint": "啟用後，底部面板會出現「標記為番外」按鈕。標記 AI 訊息時，會連同緊鄰的上一則使用者訊息一起排除，不被Horae追蹤、不參與自動總結，適合在主線中穿插if/番外/小劇場。",
         "autoSummary": "自動總結 & 隱藏",
         "autoSummaryHint": "未總結內容達到觸發閾值時，會自動將舊事件交給AI壓縮為總結，節省Token。\n壓縮後的總結可在時間線中切換回原始事件查看。",
         "enableAutoSummary": "啟用自動總結",

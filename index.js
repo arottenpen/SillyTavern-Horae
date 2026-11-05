@@ -2655,7 +2655,11 @@ function _normalizeAutoSummaryCoverage(chat) {
     const claimedBy = new Map();
     for (const s of summaries) {
         for (const idx of getSummaryMsgIndices(s)) {
-            if (Number.isInteger(idx) && idx >= hideAnchor && idx < chat.length && !claimedBy.has(idx)) {
+            if (Number.isInteger(idx)
+                && idx >= hideAnchor
+                && idx < chat.length
+                && !chat[idx]?.horae_meta?._skipHorae
+                && !claimedBy.has(idx)) {
                 claimedBy.set(idx, s.id);
             }
         }
@@ -2665,7 +2669,11 @@ function _normalizeAutoSummaryCoverage(chat) {
     for (const s of summaries) {
         const covered = new Set(
             getSummaryMsgIndices(s)
-                .filter(i => Number.isInteger(i) && i >= hideAnchor && i < chat.length && !!chat[i])
+                .filter(i => Number.isInteger(i)
+                    && i >= hideAnchor
+                    && i < chat.length
+                    && !!chat[i]
+                    && !chat[i].horae_meta?._skipHorae)
         );
         const rangeStart = Array.isArray(s.range) ? Number(s.range[0]) : NaN;
         const rangeEnd = Array.isArray(s.range) ? Number(s.range[1]) : NaN;
@@ -2873,7 +2881,7 @@ async function _removeSummaryAndRestoreHierarchy(chat, summaryId) {
         const span = childRange ? Math.max(1, childRange[1] - childRange[0] + 1) : Number.MAX_SAFE_INTEGER;
         const owner = { id: childId, depth, span };
         for (const idx of getSummaryMsgIndices(child)) {
-            if (!Number.isInteger(idx)) continue;
+            if (!Number.isInteger(idx) || chat[idx]?.horae_meta?._skipHorae) continue;
             const prev = childOwnerByMsg.get(idx);
             childOwnerByMsg.set(idx, _pickPreferredSummaryOwner(prev, owner));
         }
@@ -2899,7 +2907,8 @@ async function _removeSummaryAndRestoreHierarchy(chat, summaryId) {
 
     if (removedEntry) {
         const affected = new Set(
-            getSummaryMsgIndices(removedEntry).filter(i => Number.isInteger(i) && i >= 0 && !!chat[i])
+            getSummaryMsgIndices(removedEntry)
+                .filter(i => Number.isInteger(i) && i >= 0 && !!chat[i] && !chat[i].horae_meta?._skipHorae)
         );
 
         if (affected.size > 0) {
@@ -2907,7 +2916,7 @@ async function _removeSummaryAndRestoreHierarchy(chat, summaryId) {
             const activeSummaries = (firstMeta?.autoSummaries || []).filter(s => s?.id && s.active !== false);
             for (const s of activeSummaries) {
                 for (const idx of getSummaryMsgIndices(s)) {
-                    if (affected.has(idx)) shouldHide.add(idx);
+                    if (affected.has(idx) && !chat[idx]?.horae_meta?._skipHorae) shouldHide.add(idx);
                 }
             }
 
@@ -2935,7 +2944,8 @@ async function toggleSummaryActive(summaryId) {
     if (!entry) return;
     entry.active = !entry.active;
     // 同步消息可见性：active=摘要模式→隐藏原消息，inactive=原始模式→显示原消息
-    const indices = getSummaryMsgIndices(entry);
+    const indices = getSummaryMsgIndices(entry)
+        .filter(i => Number.isInteger(i) && chat[i] && !chat[i].horae_meta?._skipHorae);
     if (indices.length) {
         // setMessagesHidden 内部已经 saveChat，这里不再重复存
         await setMessagesHidden(chat, indices, entry.active);
@@ -3649,7 +3659,7 @@ async function compressSelectedTimelineEvents() {
     for (const key of selectedTimelineEvents) {
         const [msgIdx, evtIdx] = key.split('-').map(Number);
         const meta = chat[msgIdx]?.horae_meta;
-        if (!meta) continue;
+        if (!meta || meta._skipHorae) continue;
         const evtsArr = meta.events || (meta.event ? [meta.event] : []);
         const evt = evtsArr[evtIdx];
         if (!evt) continue;
@@ -3860,7 +3870,10 @@ async function compressSelectedTimelineEvents() {
 
         const summaryId = `cs_${Date.now()}`;
         const coveredIndices = [];
-        for (let i = rangeMin; i <= rangeMax; i++) coveredIndices.push(i);
+        for (let i = rangeMin; i <= rangeMax; i++) {
+            if (!chat[i] || chat[i].horae_meta?._skipHorae) continue;
+            coveredIndices.push(i);
+        }
         let nextDepth = 1;
         if (_selectedSummaryIds.size > 0) {
             let maxDepth = 1;
@@ -3895,8 +3908,7 @@ async function compressSelectedTimelineEvents() {
         firstMsg.horae_meta.autoSummaries.push(summaryEntry);
 
         // 标记原始事件为已压缩，并清掉旧摘要卡片
-        const compressedMsgIndices = [];
-        for (let i = rangeMin; i <= rangeMax; i++) compressedMsgIndices.push(i);
+        const compressedMsgIndices = [...coveredIndices];
         for (const msgIdx of compressedMsgIndices) {
             const meta = chat[msgIdx]?.horae_meta;
             if (!meta) continue;
@@ -3930,9 +3942,8 @@ async function compressSelectedTimelineEvents() {
             });
         }
 
-        // 隐藏范围内所有楼层（包括中间的 USER 消息）
-        const hideIndices = [];
-        for (let i = rangeMin; i <= rangeMax; i++) hideIndices.push(i);
+        // 只隐藏实际进入摘要覆盖集合的楼层；番外对保持原状。
+        const hideIndices = [...coveredIndices];
         await setMessagesHidden(chat, hideIndices, true);
 
         overlay.remove();
@@ -12448,13 +12459,115 @@ function bindAffectionInputs(container) {
     });
 }
 
+/** 将番外 AI 与紧邻的上一条 USER 组成一对；不跨越其它楼层寻找。 */
+function _markSideplayUserPair(chat, aiMessageId, aiMeta) {
+    const userIndex = aiMessageId - 1;
+    const userMessage = chat?.[userIndex];
+    if (!userMessage?.is_user) {
+        delete aiMeta._sideplayPairId;
+        return null;
+    }
+
+    const pairId = aiMeta._sideplayPairId
+        || `sp_${Date.now()}_${aiMessageId}_${Math.random().toString(36).slice(2, 7)}`;
+    const userMeta = userMessage.horae_meta || createEmptyMeta();
+    userMeta._sideplayPairId = pairId;
+    if (!userMeta._skipHorae) {
+        userMeta._skipHorae = true;
+        userMeta._skipHoraeBySideplay = pairId;
+    }
+    userMessage.horae_meta = userMeta;
+    aiMeta._sideplayPairId = pairId;
+    return userIndex;
+}
+
+/** 只撤销由当前番外 AI 创建的 USER 排除标记，保留其它来源的跳过状态。 */
+function _unmarkSideplayUserPair(chat, aiMessageId, aiMeta) {
+    const pairId = aiMeta?._sideplayPairId;
+    delete aiMeta._sideplayPairId;
+    if (!pairId) return null;
+
+    let userIndex = aiMessageId - 1;
+    if (!chat?.[userIndex]?.is_user || chat[userIndex].horae_meta?._sideplayPairId !== pairId) {
+        userIndex = chat.findIndex(msg => msg?.is_user && msg.horae_meta?._sideplayPairId === pairId);
+    }
+    if (userIndex < 0) return null;
+
+    const userMessage = chat[userIndex];
+    const userMeta = userMessage?.horae_meta;
+    if (!userMessage?.is_user || !userMeta) return null;
+
+    if (userMeta._skipHoraeBySideplay === pairId) {
+        delete userMeta._skipHorae;
+        delete userMeta._skipHoraeBySideplay;
+    }
+    if (userMeta._sideplayPairId === pairId) delete userMeta._sideplayPairId;
+    return userIndex;
+}
+
+/** 为旧版仅标记 AI 的番外数据补齐 USER 配对，并清理失效的配对来源。 */
+function _syncSideplayUserPairs(chat) {
+    if (!Array.isArray(chat) || chat.length === 0) return 0;
+    const livePairIds = new Set();
+    let changed = 0;
+
+    for (let i = 0; i < chat.length; i++) {
+        const message = chat[i];
+        const meta = message?.horae_meta;
+        if (!message || message.is_user || !meta?._skipHorae) continue;
+
+        const previousPairId = meta._sideplayPairId;
+        const previousUserMeta = chat[i - 1]?.is_user ? chat[i - 1].horae_meta : null;
+        const previousUserState = {
+            pairId: previousUserMeta?._sideplayPairId,
+            skipped: !!previousUserMeta?._skipHorae,
+            source: previousUserMeta?._skipHoraeBySideplay,
+        };
+        const userIndex = _markSideplayUserPair(chat, i, meta);
+        if (meta._sideplayPairId) livePairIds.add(meta._sideplayPairId);
+        if (userIndex !== null) {
+            const currentUserMeta = chat[userIndex]?.horae_meta;
+            if (previousPairId !== meta._sideplayPairId
+                || previousUserState.pairId !== currentUserMeta?._sideplayPairId
+                || previousUserState.skipped !== !!currentUserMeta?._skipHorae
+                || previousUserState.source !== currentUserMeta?._skipHoraeBySideplay) {
+                changed++;
+            }
+        }
+    }
+
+    for (const message of chat) {
+        if (!message?.is_user || !message.horae_meta) continue;
+        const meta = message.horae_meta;
+        const pairId = meta._sideplayPairId;
+        if (!pairId || livePairIds.has(pairId)) continue;
+        if (meta._skipHoraeBySideplay === pairId) {
+            delete meta._skipHorae;
+            delete meta._skipHoraeBySideplay;
+        }
+        delete meta._sideplayPairId;
+        changed++;
+    }
+
+    return changed;
+}
+
 /** 切换消息的番外/小剧场标记 */
 async function toggleSideplay(messageId, panelEl) {
+    const chat = horaeManager.getChat();
     const meta = horaeManager.getMessageMeta(messageId);
     if (!meta) return;
     const wasSkipped = !!meta._skipHorae;
     meta._skipHorae = !wasSkipped;
+    if (meta._skipHorae) {
+        _markSideplayUserPair(chat, messageId, meta);
+    } else {
+        _unmarkSideplayUserPair(chat, messageId, meta);
+    }
     horaeManager.setMessageMeta(messageId, meta);
+
+    // 旧摘要覆盖范围可能曾包含这两层；归一化时把番外对从覆盖集合中剔除。
+    _normalizeAutoSummaryCoverage(chat);
 
     // 关系网络/场景记忆会从全量消息重建，需排除番外消息后立即回收
     horaeManager.rebuildRelationships();
@@ -16964,6 +17077,7 @@ function _collectAutoResummaryPayload(chat, plan, cutoff) {
         for (const idx of indices) {
             if (!Number.isInteger(idx) || idx < 0 || idx >= cutoff || !chat?.[idx]) continue;
             if (blockedByHigherDepth.has(idx)) continue;
+            if (chat[idx]?.horae_meta?._skipHorae) continue;
             coveredSet.add(idx);
         }
     }
@@ -18081,7 +18195,9 @@ function _collectActiveSummaryCoveredIndices(chat) {
     for (const s of sums) {
         if (!s?.id || s.active === false) continue;
         for (const idx of getSummaryMsgIndices(s)) {
-            if (Number.isInteger(idx) && idx >= 0) covered.add(idx);
+            if (Number.isInteger(idx) && idx >= 0 && chat[idx] && !chat[idx].horae_meta?._skipHorae) {
+                covered.add(idx);
+            }
         }
     }
     return covered;
@@ -20787,6 +20903,7 @@ async function onMessageDeleted(reportedChatLength = null) {
         const chat = horaeManager.getChat();
         const summaryDeletionBoundary = _resolveSummaryDeletionBoundary(chat, reportedChatLength);
         await _removeSummariesCoveringDeletedFloors(chat, summaryDeletionBoundary);
+        _syncSideplayUserPairs(chat);
 
         horaeManager.rebuildTableData();
         horaeManager.rebuildRelationships();
@@ -20822,11 +20939,18 @@ function onMessageEdited(messageId) {
 
             const savedFlags = _saveCompressedFlags(message.horae_meta);
             const savedGlobal = messageId === 0 ? _saveGlobalMeta(message.horae_meta) : null;
+            const savedSideplay = message.horae_meta?._skipHorae
+                ? {
+                    _skipHorae: true,
+                    _sideplayPairId: message.horae_meta._sideplayPairId,
+                }
+                : null;
             message.horae_meta = createEmptyMeta();
 
             horaeManager.processAIResponse(messageId, message.mes);
             _restoreCompressedFlags(message.horae_meta, savedFlags);
             if (savedGlobal) _restoreGlobalMeta(message.horae_meta, savedGlobal);
+            if (savedSideplay) Object.assign(message.horae_meta, savedSideplay);
 
             horaeManager.rebuildTableData();
             horaeManager.rebuildRelationships();
@@ -21469,6 +21593,14 @@ async function onChatChanged() {
             }
         } catch (e) {
             console.warn('[Horae] 摘要迁移失败：', e);
+        }
+
+        // ── 迁移旧数据：旧版只给番外 AI 打标，补齐紧邻的 USER 配对 ──
+        const sideplayPairsChanged = _syncSideplayUserPairs(_mc);
+        if (sideplayPairsChanged > 0) {
+            _normalizeAutoSummaryCoverage(_mc);
+            await getContext().saveChat();
+            console.log(`[Horae] 番外配对迁移：修复 ${sideplayPairsChanged} 组 USER/AI 标记`);
         }
 
         _rebuildGlobalDataForCurrentChat();

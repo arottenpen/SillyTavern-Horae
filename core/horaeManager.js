@@ -3405,7 +3405,8 @@ class HoraeManager {
             'locationMemory', 'relationships', 'tableContributions',
             'rpg', '_rpgChanges',
             '_deletedNpcs', '_deletedAgendaTexts',
-            '_rpgConfigs', '_pendingScanReview', '_userAddedNpcs'
+            '_rpgConfigs', '_pendingScanReview', '_userAddedNpcs',
+            '_sideplayPairId'
         ];
 
         for (let i = 0; i < chat.length; i++) {

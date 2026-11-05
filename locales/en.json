@@ -299,7 +299,7 @@
         "antiParaphrase": "Anti-Paraphrase Mode",
         "antiParaphraseHint": "For play styles where USER writes their own actions. AI's <horae> tags will also account for the previous USER message.",
         "sideplayMode": "Side Story / Mini-Theater",
-        "sideplayModeHint": "Adds a 'Mark as side story' button. Marked messages are not tracked by Horae or included in auto-summaries.",
+        "sideplayModeHint": "Adds a 'Mark as side story' button. Marking an AI message also excludes the immediately preceding user message from Horae tracking and auto-summaries.",
         "autoSummary": "Auto Summary & Hide",
         "autoSummaryHint": "When unsummarized content reaches the trigger threshold, old events are auto-compressed into AI summaries to save tokens.\nCompressed summaries can be expanded back to original events.",
         "enableAutoSummary": "Enable Auto Summary",

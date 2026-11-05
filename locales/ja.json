@@ -305,7 +305,7 @@
         "antiParaphrase": "アンチパラフレーズモード",
         "antiParaphraseHint": "USERが自分の行動を書くプレイスタイル向け。AIの <horae> タグは前回のUSERメッセージも考慮します。",
         "sideplayMode": "サイドストーリー / ミニシアター",
-        "sideplayModeHint": "「サイドストーリーとしてマーク」ボタンを追加。マークされたメッセージはHoraeで追跡されず、自動要約にも含まれません。",
+        "sideplayModeHint": "「サイドストーリーとしてマーク」ボタンを追加。AIメッセージをマークすると、直前のユーザーメッセージもHoraeの追跡と自動要約から除外されます。",
         "autoSummary": "自動要約＆非表示",
         "autoSummaryHint": "古いイベントをAI生成の要約に自動圧縮し、トークンを節約します。\n圧縮された要約は元のイベントに展開可能です。",
         "enableAutoSummary": "自動要約を有効化",
