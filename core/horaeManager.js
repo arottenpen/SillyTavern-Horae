@@ -112,6 +112,14 @@ function findExistingItemByBaseName(stateItems, newName) {
     return null;
 }
 
+/** 待办文本匹配：允许 AI 在完成时对原待办做轻微缩写或扩写 */
+function agendaTextsMatch(agendaText, deleteText) {
+    if (!agendaText || !deleteText) return false;
+    return agendaText === deleteText ||
+           agendaText.includes(deleteText) ||
+           deleteText.includes(agendaText);
+}
+
 /** Horae 管理器 */
 class HoraeManager {
     constructor() {
@@ -1711,18 +1719,26 @@ class HoraeManager {
             Object.assign(meta.npcs, parsed.npcs);
         }
         
-        // 追加AI写入的待办（跳过用户已手动删除的）
+        // 追加AI写入的待办（跳过用户手动删除或 AI 已完成的）
         if (parsed.agenda && parsed.agenda.length > 0) {
             if (!meta.agenda) meta.agenda = [];
             const chat0 = this.getChat()?.[0];
-            const deletedSet = new Set(chat0?.horae_meta?._deletedAgendaTexts || []);
+            const deletedTexts = chat0?.horae_meta?._deletedAgendaTexts || [];
             for (const item of parsed.agenda) {
-                if (deletedSet.has(item.text)) continue;
+                if (deletedTexts.some(text => agendaTextsMatch(item.text, text))) continue;
                 const isDupe = meta.agenda.some(a => a.text === item.text);
                 if (!isDupe) {
                     meta.agenda.push(item);
                 }
             }
+        }
+
+        // 当前消息可能在已有 meta 上追加 agenda-，必须同时从克隆出的 meta 中移除，
+        // 否则 removeCompletedAgenda 清掉旧对象后，setMessageMeta 又会把它写回来。
+        if (parsed.deletedAgenda?.length > 0 && meta.agenda?.length > 0) {
+            meta.agenda = meta.agenda.filter(
+                item => !parsed.deletedAgenda.some(text => agendaTextsMatch(item.text, text))
+            );
         }
 
         if (parsed.deletedAgenda && parsed.deletedAgenda.length > 0) {
@@ -2769,25 +2785,42 @@ class HoraeManager {
         const chat = this.getChat();
         if (!chat || deletedTexts.length === 0) return;
 
-        const isMatch = (agendaText, deleteText) => {
-            if (!agendaText || !deleteText) return false;
-            // 精确匹配 或 互相包含（允许AI缩写/扩写）
-            return agendaText === deleteText ||
-                   agendaText.includes(deleteText) ||
-                   deleteText.includes(agendaText);
+        const cleanDeletedTexts = deletedTexts
+            .map(text => String(text || '').trim())
+            .filter(Boolean);
+        if (cleanDeletedTexts.length === 0) return;
+
+        const matchedAgendaTexts = new Set();
+        const shouldRemove = (item) => {
+            const matched = cleanDeletedTexts.some(text => agendaTextsMatch(item?.text, text));
+            if (matched && item?.text) matchedAgendaTexts.add(item.text);
+            return matched;
         };
 
         if (chat[0]?.horae_meta?.agenda) {
             chat[0].horae_meta.agenda = chat[0].horae_meta.agenda.filter(
-                a => !deletedTexts.some(dt => isMatch(a.text, dt))
+                item => !shouldRemove(item)
             );
         }
 
         for (let i = 1; i < chat.length; i++) {
             if (chat[i]?.horae_meta?.agenda?.length > 0) {
                 chat[i].horae_meta.agenda = chat[i].horae_meta.agenda.filter(
-                    a => !deletedTexts.some(dt => isMatch(a.text, dt))
+                    item => !shouldRemove(item)
                 );
+            }
+        }
+
+        // 与用户手动删除共用持久化墓碑，避免单条重解析或全量扫描后复活。
+        if (matchedAgendaTexts.size > 0 && chat[0]) {
+            if (!chat[0].horae_meta) chat[0].horae_meta = createEmptyMeta();
+            if (!chat[0].horae_meta._deletedAgendaTexts) {
+                chat[0].horae_meta._deletedAgendaTexts = [];
+            }
+            for (const text of matchedAgendaTexts) {
+                if (!chat[0].horae_meta._deletedAgendaTexts.includes(text)) {
+                    chat[0].horae_meta._deletedAgendaTexts.push(text);
+                }
             }
         }
     }
@@ -3479,6 +3512,9 @@ class HoraeManager {
                 }
                 _applyPreserved(meta);
                 this.setMessageMeta(i, meta);
+                if (parsed.deletedAgenda?.length > 0) {
+                    this.removeCompletedAgenda(parsed.deletedAgenda);
+                }
                 processed++;
             } else if (analyzeCallback) {
                 try {
@@ -3491,6 +3527,9 @@ class HoraeManager {
                         }
                         _applyPreserved(meta);
                         this.setMessageMeta(i, meta);
+                        if (analyzed.deletedAgenda?.length > 0) {
+                            this.removeCompletedAgenda(analyzed.deletedAgenda);
+                        }
                         processed++;
                     }
                 } catch (error) {
